@@ -17,7 +17,7 @@ def get_client():
     return PersistentClient(path=str(DB_DIR))
 
 @st.cache_resource
-def get_collection(client):
+def get_collection(_client):
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
