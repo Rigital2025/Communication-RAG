@@ -1,86 +1,105 @@
-import os
-from pathlib import Path
+# app.py
+import os, glob
 import streamlit as st
+from pathlib import Path
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_community.vectorstores import Chroma
-
+DB_DIR = Path("chroma_db")
 DATA_DIR = Path("data")
-DB_DIR = Path(".chroma")
-EMBED_MODEL = "all-MiniLM-L6-v2"  # small, fast, no API key
+COLLECTION = "docs"
 
-def load_docs(data_dir: Path):
+@st.cache_resource
+def get_client():
+    DB_DIR.mkdir(exist_ok=True)
+    return chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=str(DB_DIR)))
+
+@st.cache_resource
+def get_model():
+    # small, fast, good quality
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+def load_pdfs():
     docs = []
-    for pdf in sorted(data_dir.glob("*.pdf")):
-        loader = PyPDFLoader(str(pdf))
-        pages = loader.load()
-        for p in pages:
-            p.metadata["source"] = pdf.name
-        docs.extend(pages)
+    for pdf_path in sorted(DATA_DIR.glob("*.pdf")):
+        try:
+            reader = PdfReader(str(pdf_path))
+            for i, page in enumerate(reader.pages):
+                text = (page.extract_text() or "").strip()
+                if text:
+                    docs.append({
+                        "id": f"{pdf_path.name}-p{i+1}",
+                        "text": text,
+                        "meta": {"file": pdf_path.name, "page": i+1}
+                    })
+        except Exception as e:
+            st.warning(f"Skipping {pdf_path.name}: {e}")
     return docs
 
-def build_or_load_db(force_rebuild: bool = False):
-    embeddings = SentenceTransformerEmbeddings(model_name=EMBED_MODEL)
+def rebuild_index():
+    cl = get_client()
+    try:
+        cl.delete_collection(COLLECTION)
+    except Exception:
+        pass
+    col = cl.create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
+    model = get_model()
+    docs = load_pdfs()
+    if not docs:
+        return 0
+    # batch insert
+    B = 64
+    for i in range(0, len(docs), B):
+        batch = docs[i:i+B]
+        embeddings = model.encode([d["text"] for d in batch], show_progress_bar=False).tolist()
+        col.add(
+            ids=[d["id"] for d in batch],
+            documents=[d["text"] for d in batch],
+            metadatas=[d["meta"] for d in batch],
+            embeddings=embeddings,
+        )
+    # persist
+    cl.persist()
+    return len(docs)
 
-    if force_rebuild and DB_DIR.exists():
-        for p in DB_DIR.glob("**/*"):
-            try:
-                p.unlink()
-            except IsADirectoryError:
-                pass
-        try:
-            DB_DIR.rmdir()
-        except Exception:
-            pass
+def query_index(q, k=3):
+    cl = get_client()
+    try:
+        col = cl.get_collection(COLLECTION)
+    except Exception:
+        return []
+    model = get_model()
+    q_emb = model.encode([q]).tolist()
+    res = col.query(query_embeddings=q_emb, n_results=k)
+    out = []
+    for doc, meta, dist in zip(res.get("documents",[[]])[0], res.get("metadatas",[[]])[0], res.get("distances",[[]])[0]):
+        out.append((doc, meta, dist))
+    return out
 
-    if DB_DIR.exists() and not force_rebuild:
-        return Chroma(persist_directory=str(DB_DIR), embedding_function=embeddings)
-
-    raw_docs = load_docs(DATA_DIR)
-    if not raw_docs:
-        return None
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
-    chunks = splitter.split_documents(raw_docs)
-    db = Chroma.from_documents(chunks, embeddings, persist_directory=str(DB_DIR))
-    db.persist()
-    return db
-
-st.set_page_config(page_title="Communication RAG", page_icon="🧭", layout="wide")
-st.title("Communication‑RAG 🧭📜")
-st.caption("Ask questions about your Communication Game & All The Smoke PDFs. Returns grounded passages with citations.")
+# -------- UI --------
+st.set_page_config(page_title="Communication‑RAG", page_icon="🚀", layout="wide")
+st.title("Communication‑RAG 🚀")
 
 with st.sidebar:
     st.subheader("Index")
-    if st.button("🔄 Rebuild index"):
-        db = build_or_load_db(force_rebuild=True)
-        if db is None:
-            st.error("No PDFs found in ./data. Add files and try again.")
-        else:
-            st.success("Index rebuilt.")
-    st.markdown("---")
-    st.info("Put PDFs in `./data/` then click **Rebuild index**.")
+    pdfs = sorted(DATA_DIR.glob("*.pdf"))
+    st.caption(f"Found {len(pdfs)} PDF(s) in ./data")
+    if st.button("🔁 Rebuild index", use_container_width=True):
+        n = rebuild_index()
+        st.success(f"Indexed {n} page chunks.")
 
-db = build_or_load_db(force_rebuild=False)
+st.write("Ask about your PDFs and get grounded snippets with file + page.")
 
-q = st.text_input("Your question", placeholder="e.g., What is LUV‑FFO and how is it used?")
-k = st.slider("Results to show", 1, 5, 3)
-
-if st.button("Search") or (q and st.session_state.get("auto_run")):
-    if db is None:
-        st.error("I can't find any PDFs. Add them to `./data/` and rebuild the index.")
+q = st.text_input("Your question")
+top_k = st.slider("Results", 1, 10, 3)
+if q:
+    hits = query_index(q, k=top_k)
+    if not hits:
+        st.info("No index yet. Click **Rebuild index** in the sidebar.")
     else:
-        retriever = db.as_retriever(search_kwargs={"k": k})
-        results = retriever.get_relevant_documents(q)
-        if not results:
-            st.warning("No matches found. Try rephrasing.")
-        else:
-            st.subheader("Top matches")
-            for i, doc in enumerate(results, 1):
-                meta = doc.metadata or {}
-                src = meta.get("source", "unknown.pdf")
-                page = meta.get("page", "?")
-                with st.expander(f"{i}. {src} — page {page}"):
-                    st.write(doc.page_content)
+        for i, (doc, meta, dist) in enumerate(hits, 1):
+            st.markdown(f"**{i}. {meta['file']} · p.{meta['page']}** — _(distance: {dist:.3f})_")
+            st.write(doc[:1200] + ("…" if len(doc) > 1200 else ""))
+            st.divider()
