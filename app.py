@@ -1,6 +1,10 @@
 # app.py
 import os, glob
 import streamlit as st
+
+# clear any old cache (one-time nuke)
+st.cache_resource.clear()
+st.cache_data.clear()
 from pathlib import Path
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
