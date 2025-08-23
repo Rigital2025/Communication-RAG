@@ -4,115 +4,104 @@ import streamlit as st
 from pathlib import Path
 from pypdf import PdfReader
 
-# ✅ New Chroma API (no Settings)
+# Chroma 0.5+ API
 from chromadb import PersistentClient
 from chromadb.utils import embedding_functions
 
-# ---- Paths / constants -------------------------------------------------------
-DB_DIR = Path("chroma_db")          # where Chroma stores the index
-DATA_DIR = Path("data")             # put your PDFs here
+# ---------- paths & constants ----------
+DB_DIR   = Path("chroma_db")     # persisted vector DB
+DATA_DIR = Path("data")          # where your PDFs live
 COLLECTION = "docs"
 
-# ---- Caching helpers ---------------------------------------------------------
+# ---------- cached singletons ----------
 @st.cache_resource
-def get_client():
+def get_client() -> PersistentClient:
     DB_DIR.mkdir(exist_ok=True)
     return PersistentClient(path=str(DB_DIR))
 
 @st.cache_resource
-def get_collection(client):
-    # Use a local Sentence-Transformers embedding function (no API key needed)
+def get_collection():
+    client = get_client()
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-    return client.get_or_create_collection(
-        name=COLLECTION,
-        embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+    return client.get_or_create_collection(COLLECTION, embedding_function=ef)
 
-# ---- PDF loading -------------------------------------------------------------
+# ---------- helpers ----------
 def load_pdfs():
     docs = []
     for pdf_path in sorted(DATA_DIR.glob("*.pdf")):
         try:
-            reader = PdfReader(str(pdf_path))
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text() or ""
-                text = " ".join(text.split())
-                if not text:
-                    continue
-                docs.append(
-                    {
-                        "id": f"{pdf_path.stem}-{i+1}",
-                        "document": text,
-                        "metadata": {"source": pdf_path.name, "page": i + 1},
-                    }
-                )
+            txt = []
+            with open(pdf_path, "rb") as f:
+                reader = PdfReader(f)
+                for p in reader.pages:
+                    t = p.extract_text() or ""
+                    if t.strip():
+                        txt.append(t)
+            if txt:
+                docs.append({"file": pdf_path.name, "text": "\n".join(txt)})
         except Exception as e:
-            st.warning(f"Could not read {pdf_path.name}: {e}")
+            st.warning(f"Failed to read {pdf_path.name}: {e}")
     return docs
 
-# ---- Index build / query -----------------------------------------------------
 def rebuild_index():
-    client = get_client()
-    # drop any old collection (safe even if it's not there)
+    cl = get_client()
     try:
-        client.delete_collection(COLLECTION)
+        cl.delete_collection(COLLECTION)
     except Exception:
         pass
-
-    col = get_collection(client)
+    col = get_collection()
     docs = load_pdfs()
-    if not docs:
-        return 0
 
-    # Chroma add() expects parallel lists
-    col.add(
-        ids=[d["id"] for d in docs],
-        documents=[d["document"] for d in docs],
-        metadatas=[d["metadata"] for d in docs],
-    )
-    return len(docs)
+    ids, texts, metadatas = [], [], []
+    for i, d in enumerate(docs):
+        chunk = d["text"]
+        # coarse chunking – simple but fine for now
+        for j, s in enumerate(chunk.split("\n\n")):
+            s = s.strip()
+            if not s:
+                continue
+            ids.append(f"{d['file']}::{i}:{j}")
+            texts.append(s)
+            metadatas.append({"file": d["file"], "chunk": j})
+
+    if texts:
+        col.add(ids=ids, documents=texts, metadatas=metadatas)
+    return len(texts)
 
 def query_index(q, k=3):
-    client = get_client()
-    col = get_collection(client)
+    col = get_collection()
     try:
         res = col.query(query_texts=[q], n_results=k)
-    except Exception:
+        hits = list(zip(res.get("documents", [[]])[0],
+                        res.get("metadatas", [[]])[0]))
+        return hits
+    except Exception as e:
+        st.error(f"Query failed: {e}")
         return []
 
-    hits = []
-    for doc, meta in zip(res.get("documents", [[]])[0], res.get("metadatas", [[]])[0]):
-        hits.append({"text": doc, "source": meta.get("source"), "page": meta.get("page")})
-    return hits
+# ---------- UI ----------
+st.sidebar.header("Index")
+DATA_DIR.mkdir(exist_ok=True)
+st.sidebar.write(f"Found {len(list(DATA_DIR.glob('*.pdf')))} PDF(s) in ./data")
 
-# ---- UI ----------------------------------------------------------------------
-st.set_page_config(page_title="Communication‑RAG", page_icon="🚀", layout="wide")
-
-with st.sidebar:
-    pdf_count = len(list(DATA_DIR.glob("*.pdf")))
-    st.caption(f"Found {pdf_count} PDF(s) in ./data")
-    if st.button("🔄 Rebuild index", use_container_width=True):
-        with st.spinner("Indexing…"):
-            n = rebuild_index()
-        st.success(f"Indexed {n} chunks", icon="✅")
+if st.sidebar.button("🔄 Rebuild index"):
+    with st.spinner("Building embeddings…"):
+        n = rebuild_index()
+    st.sidebar.success(f"Indexed {n} chunks.")
 
 st.title("Communication‑RAG 🚀")
-st.write("Ask about your PDFs and get grounded snippets with file + page.")
+st.caption("Ask about your PDFs and get grounded snippets with file + page.")
 
-q = st.text_input("Your question", placeholder="e.g., What is the Communication Game about?")
-k = st.slider("Results", min_value=1, max_value=10, value=3)
+q = st.text_input("Your question", placeholder="Ask something about the PDFs…")
+k = st.slider("Results", 1, 10, 3)
 
 if q:
-    with st.spinner("Searching…"):
-        hits = query_index(q, k)
+    hits = query_index(q, k=k)
     if not hits:
-        st.info("No results yet. Try **Rebuild index** on the left, then ask again.")
+        st.info("No results yet. Try **Rebuild index** in the sidebar.")
     else:
-        for i, h in enumerate(hits, 1):
-            st.markdown(f"**{i}. {h['source']} — p.{h['page']}**")
-            st.write(h["text"])
-            st.divider()
-
+        for i, (doc, meta) in enumerate(hits, 1):
+            with st.expander(f"{i}. {meta.get('file','?')} • chunk {meta.get('chunk','?')}"):
+                st.write(doc or "")
