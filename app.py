@@ -20,13 +20,11 @@ def get_client() -> PersistentClient:
     return PersistentClient(path=str(DB_DIR))
 
 @st.cache_resource
-def get_collection():
-    # build the embedding function once and keep it with the collection
+def get_collection(_client):
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-    client = get_client()
-    return client.get_or_create_collection(COLLECTION, embedding_function=ef)
+    return _client.get_or_create_collection(COLLECTION, embedding_function=ef)
 
 @st.cache_resource
 def get_model():
@@ -60,14 +58,14 @@ def load_pdfs():
 
 def rebuild_index():
     client = get_client()
-    # drop & recreate to ensure a clean slate
     try:
         client.delete_collection(COLLECTION)
     except Exception:
         pass
 
-    col = get_collection()
+    col = get_collection(client)     # pass the client in
     docs = load_pdfs()
+
     if not docs:
         return 0
 
@@ -79,7 +77,8 @@ def rebuild_index():
     return len(docs)
 
 def query_index(q: str, k: int = 3):
-    col = get_collection()
+    client = get_client()
+    col = get_collection(client)     # pass the client in
     try:
         res = col.query(query_texts=[q], n_results=k)
         ids = res.get("ids", [[]])[0]
