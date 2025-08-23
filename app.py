@@ -3,105 +3,102 @@ import os, glob
 import streamlit as st
 from pathlib import Path
 from pypdf import PdfReader
-
-# Chroma 0.5+ API
+from sentence_transformers import SentenceTransformer
 from chromadb import PersistentClient
 from chromadb.utils import embedding_functions
 
-# ---------- paths & constants ----------
-DB_DIR   = Path("chroma_db")     # persisted vector DB
-DATA_DIR = Path("data")          # where your PDFs live
+DB_DIR = Path("chroma_db")
+DATA_DIR = Path("data")
 COLLECTION = "docs"
 
-# ---------- cached singletons ----------
 @st.cache_resource
-def get_client() -> PersistentClient:
+def get_client():
     DB_DIR.mkdir(exist_ok=True)
     return PersistentClient(path=str(DB_DIR))
 
 @st.cache_resource
-def get_collection():
-    client = get_client()
+def get_collection(client):
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
     return client.get_or_create_collection(COLLECTION, embedding_function=ef)
 
-# ---------- helpers ----------
 def load_pdfs():
     docs = []
     for pdf_path in sorted(DATA_DIR.glob("*.pdf")):
         try:
-            txt = []
-            with open(pdf_path, "rb") as f:
-                reader = PdfReader(f)
-                for p in reader.pages:
-                    t = p.extract_text() or ""
-                    if t.strip():
-                        txt.append(t)
-            if txt:
-                docs.append({"file": pdf_path.name, "text": "\n".join(txt)})
+            r = PdfReader(str(pdf_path))
+            for i, page in enumerate(r.pages):
+                text = page.extract_text() or ""
+                if text.strip():
+                    docs.append({
+                        "id": f"{pdf_path.name}-{i}",
+                        "text": text,
+                        "metadata": {"file": pdf_path.name, "page": i+1}
+                    })
         except Exception as e:
-            st.warning(f"Failed to read {pdf_path.name}: {e}")
+            st.warning(f"Could not read {pdf_path.name}: {e}")
     return docs
 
 def rebuild_index():
     cl = get_client()
+    # drop & recreate collection
     try:
         cl.delete_collection(COLLECTION)
     except Exception:
         pass
-    col = get_collection()
+    col = get_collection(cl)
+    # add docs
     docs = load_pdfs()
-
-    ids, texts, metadatas = [], [], []
-    for i, d in enumerate(docs):
-        chunk = d["text"]
-        # coarse chunking – simple but fine for now
-        for j, s in enumerate(chunk.split("\n\n")):
-            s = s.strip()
-            if not s:
-                continue
-            ids.append(f"{d['file']}::{i}:{j}")
-            texts.append(s)
-            metadatas.append({"file": d["file"], "chunk": j})
-
-    if texts:
-        col.add(ids=ids, documents=texts, metadatas=metadatas)
-    return len(texts)
+    if not docs:
+        return 0
+    col.add(
+        ids=[d["id"] for d in docs],
+        documents=[d["text"] for d in docs],
+        metadatas=[d["metadata"] for d in docs],
+    )
+    return len(docs)
 
 def query_index(q, k=3):
-    col = get_collection()
+    cl = get_client()
     try:
-        res = col.query(query_texts=[q], n_results=k)
-        hits = list(zip(res.get("documents", [[]])[0],
-                        res.get("metadatas", [[]])[0]))
-        return hits
-    except Exception as e:
-        st.error(f"Query failed: {e}")
+        col = cl.get_collection(COLLECTION)
+    except Exception:
         return []
+    res = col.query(query_texts=[q], n_results=k)
+    hits = []
+    for i in range(len(res["ids"][0])):
+        hits.append({
+            "id": res["ids"][0][i],
+            "text": res["documents"][0][i],
+            "meta": res["metadatas"][0][i]
+        })
+    return hits
 
-# ---------- UI ----------
+# ---------------- UI ----------------
+st.set_page_config(page_title="Communication-RAG", page_icon="🚀", layout="wide")
 st.sidebar.header("Index")
-DATA_DIR.mkdir(exist_ok=True)
-st.sidebar.write(f"Found {len(list(DATA_DIR.glob('*.pdf')))} PDF(s) in ./data")
+data_count = len(list(DATA_DIR.glob("*.pdf")))
+st.sidebar.write(f"Found {data_count} PDF(s) in ./data")
 
 if st.sidebar.button("🔄 Rebuild index"):
-    with st.spinner("Building embeddings…"):
+    with st.spinner("Rebuilding…"):
         n = rebuild_index()
-    st.sidebar.success(f"Indexed {n} chunks.")
+    st.success(f"Indexed {n} chunks.")
 
-st.title("Communication‑RAG 🚀")
+st.title("Communication-RAG 🚀")
 st.caption("Ask about your PDFs and get grounded snippets with file + page.")
 
-q = st.text_input("Your question", placeholder="Ask something about the PDFs…")
+q = st.text_input("Your question")
 k = st.slider("Results", 1, 10, 3)
 
 if q:
-    hits = query_index(q, k=k)
+    with st.spinner("Searching…"):
+        hits = query_index(q, k)
     if not hits:
-        st.info("No results yet. Try **Rebuild index** in the sidebar.")
+        st.error("No results (try rebuilding the index).")
     else:
-        for i, (doc, meta) in enumerate(hits, 1):
-            with st.expander(f"{i}. {meta.get('file','?')} • chunk {meta.get('chunk','?')}"):
-                st.write(doc or "")
+        for h in hits:
+            with st.expander(f'{h["meta"]["file"]} — p.{h["meta"]["page"]}  •  {h["id"]}'):
+                st.write(h["text"])
+
