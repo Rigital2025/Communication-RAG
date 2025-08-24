@@ -49,23 +49,31 @@ def load_pdfs() -> List[Dict[str, Any]]:
         docs.extend(_read_pdf(p))
     return docs
 
-# --------------- Chroma clients & collections ----------------
-@st.cache_resource
-def get_client() -> PersistentClient:
-    """Create (and cache) a Chroma PersistentClient at DB_DIR."""
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    return PersistentClient(path=str(DB_DIR))
+# Rebuild index with the new Chroma API
+def rebuild_index():
+    # point to your persistence directory
+    client = chromadb.PersistentClient(path="chroma_db")
 
-@st.cache_resource
-def get_collection(_client: PersistentClient):
-    """
-    IMPORTANT: the leading underscore in `_client` tells Streamlit not to hash it.
-    That avoids UnhashableParamError on chromadb Client objects.
-    """
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    return _client.get_or_create_collection(COLLECTION, embedding_function=ef)
+    collection = client.get_or_create_collection(name="comm_docs")
+
+    # wipe old collection before reloading
+    collection.delete(where={})
+
+    # Load PDFs
+    pdf_files = [
+        "Refine_The_Communication_Game_Breakdown_To_Breakthrough.pdf",
+        "All_The_Smoke_Communication_Course_Coaching.pdf"
+    ]
+
+    for pdf in pdf_files:
+        loader = PyPDFLoader(pdf)
+        pages = loader.load_and_split()
+        for i, page in enumerate(pages):
+            collection.add(
+                documents=[page.page_content],
+                ids=[f"{pdf}_{i}"]
+            )
+    return collection
 
 # --------------- Index ops ----------------
 def rebuild_index() -> int:
